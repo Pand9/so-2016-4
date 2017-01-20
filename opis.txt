@@ -1,0 +1,87 @@
+Słownik:
+worker - wątek serwera, który nie jest głównym wątkiem
+
+1. Jaki jest format komunikatów?
+- Format danych w komunikatach jest taki, jak reprezentacja w pamięci structów w pliku kom.h. W pamięci dzielonej/komunikatach kolejek nie jest zapisywane nic innego.
+- Dodatkowo, "komunikatami" można nazwać sygnały SIGUSR1 i SIGUSR2, które są wysyłane z serwera do klientów, w implementacji kom-s.h. Są to "zwykłe" sygnały, poza nimi nie jest nic innego przesyłane.
+- Więcej w pkt. 4.
+
+2. Ile zastosowano kolejek/segmentów pamięci?
+- Zastosowano dwie kolejki (systemV) i jeden segment pamięci (systemV). W pamięci trzymana jest unia struktur z pliku kom.h i rozmiar jest taki, jak rozmiar tej struktury.
+- Jedna kolejka przesyła od klienta do serwera, a druga na odwrót. Segment pamięci działa w dwie strony.
+- Jest też 5 semaforów, z czego jeden nienazwany, między wątkami, a pozostałe cztery nazwane.
+
+3. Synchronizacja dostępu do tablicy
+- Każde pole tablicy chronione jest niezależnie.
+- Istnieje pojęcie "właściciela" pola. Pole może mieć 1 lub 0 właścicieli. Tylko właściciel może zmieniać wartość pola. Każdy może czytać pole. Dla danych operacji, potrzebne jest posiadanie następujących pól:
+    - "w i1 STH" - pole "i1"
+    - "r i" - żadne pole
+    - "x i1 i2" - na czas od początku do końca operacji, potrzebne są "i1" i "i2"
+    - "s i1 i2 ... in" - na czas od początku do końca operacji, potrzebne są wszystkie pola.
+    - Tylko w przypadku "r 1" mówimy o tymczasowym posiadaniu.
+    - Działa to dzięki temu, że wszystkie operacje na zmiennych globalnych wykonywane są pod ochroną mutexa.
+- Z interpretacji tej wynika, że operacje "s 0 2 3" i "s 1 2 3" nie mogą zostać wykonane jednoczesnie. Jest to niedoróbka implementacyjna - wymagałoby to rozróznienia "czytelników" i "pisarzy". W tej implementacji każdy jest "pisarzem". Operacja "r" nie wymaga ani jednego, ani drugiego. Warto zauważyć, że jedyne problematyczne sytuacje to takie, w których operacja ma format "s i0 i1 ... in", gdzie i0 nie jest posiadany przez nikogo, a i1, ..., in są albo niezarezerwowane przez nikogo, albo jedynie do czytania przez inne operacje postaci "s j0 j1 ... jn".
+- Klient próbuje uzyskać dostęp do zasobów w kolejności wartości indeksów, żeby nie było zakleszczeń.
+- Jeśli właścicielem zasobu jest ktoś inny, niż klient obsługiwany przez workera, to klient oczekuje (na kolejce array[i].on_access : pthread_cond_t) na swoją kolej.
+- Gdy klient uzyska dostęp do wszystkich zasobów, to przesyła odpowiedź do klienta - zależnie od zapytania, albo są to wartości dla danych zasobów (w przypadku operacji "s" i "x"), albo "OK".
+
+
+Dodatkowe info o synchronizacji i komunikacji:
+
+
+4. Formaty komunikatów
+- Są cztery rodzaje komunikatów do serwera - wszystkie zawierają dodatkowo PID klienta:
+    - Hello! - pierwszy komunikat od klienta
+    - Goodbye! - ostatni komunikat.
+    - ustaw indeksom i1[, i2] (max 2) wartości w1[, w2] i spraw, żebym już nie był ich właścicielem. (O tym, co to znaczy, w punkcie c.)
+    - zwróć wartości spod indeksów i1[, i2, ...] (od 1 do 9), być może (zależnie od flagi w komunikacie) zarezerwuj te indeksy, i być może (też zaleznie od flagi w komunikacie) zarezerwuj dodatkowy indeks i0.
+- Serwer odpowiada na wszystkie, poza Goodbye.
+- Jedyne komunikaty od serwera to odpowiedzi.
+- Są dwa rodzaje komunikatów od serwera:
+    - OK - potwierdzenie odebrania i wykonania zadanych prac (rezerwacje, ustawienie wartości)
+    - Wartości - liczby, o które spytano.
+- Dostęp do tablicy wygląda tak:
+5. Przesyłanie komunikatów itd - szczegóły:
+    a) Przekazanie wiadomości od klienta do głównego wątku serwera:
+        - Wersja z kolejkami komunikatów:
+            - Klient wysyła specjalny typ wiadomości (typ 1, zdefine'owany w kom.h) do serwera, wywołaniem msgsnd.
+            - Serwer (główny wątek) odbiera komunikat wywołaniem (msgrcv).
+        - Wersja z semaforami:
+            - Synchronicznie, na semaforach POSIX, wywołaniami sem_wait i sem_post. Używane jest dziedziczenie sekcji krytycznej (serwer dziedziczy).
+                - Są używane na tym etapie 3 semafory:
+                    - on_memory (wyłączny dostęp do pamięci)
+                    - on_client (podnoszony, gdy klient zapisał dane w pamięci - serwer na nim oczekuje, gdy nie ma żadnych komunikatów)
+                    - on_server (podnoszony, gdy serwer potwierdza, że odebrał wiadomość)
+        - Warto wspomnieć, że każdy komunikat od klienta zawiera w sobie PID klienta. Klienci są identyfikowani tym PIDem przez czas komunikacji.
+    b) Przekazanie wiadomości od głównego wątku do workera:
+        - Najpierw trzeba wspomnieć, że wszystkie komunikaty od klientów odbiera główny wątek. Przekazuje on go następnie odpowiedniemu workerowi - chyba, że jest to "hello" od nowego klienta lub "goodbye" od klienta, który już skończył pracę.
+        - Główny wątek odbiera komunikat z biblioteki kom.h i przekazuje go odpowiedniemu workerowi. Synchronizacja korzysta z pthread_cond_t (o nazwie on_last_msg_copied), która jest zmienną globalną, i innej zmiennej globalnej na komunikat.
+        - Można to zobaczyć w funkcji serwer.c:main_pass_msg_to_thread i serwer.c:worker_handle_client (na początku pętli).
+    c) Oczekiwanie na dostęp do zasobów:
+        - Tak jak napisane wyżej, w akapicie o dostępie do tablicy.
+    d) Przekazanie odpowiedzi od serwera do klienta:
+        - Wersja z kolejkami komunikatów - tak samo, jak a), ale w drugą stronę, z jednym wyjątkiem:
+            - Odpowiedź przesyła worker (wątek) i jest przesyłana do konkretnego klienta - jako "typ" wiadomości podajemy więc PID klienta. PID czekając na wiadomość od serwera, także podaje PID jako typ.
+        - Wersja z semaforami - też analogicznie, ale są dodatkowe mechanizmy:
+            - Semafor on_threads. Ponieważ semafory nazwane nie są thread-safe, tylko jeden wątek może ich używać; wobec tego są one strzeżone semaforo-mutexem on_threads.
+            - Sygnał SIGUSR1 do klienta. Sygnał jest potrzebny, ponieważ musimy obudzić konkretnego klienta, a mamy tylko kilka semaforów.
+                - Klient blokuje sygnał przez czas działania programu-klienta. Odbiera sygnał dopiero wywołaniem sigsuspend. Zaimplementowane jest to w funkcji kom-s.h:client_signalwait_.
+            - Semafor on_client_resp. Służy do odebrania potwierdzenia od klienta, że ten odebrał wiadomość. Serwer musi to wiedzieć, bo to on podnosi semafor on_memory na koniec. (Jak tak teraz myślę, to chyba mógłby to robić klient i byłoby semafora mniej :))
+    e) Kończenie pracy klienta:
+        - Klient przesyła komunikat Goodbye.
+        - Wątek główny serwera kończy pracę wątku-workera.
+        - Worker dowiaduje się o tym, gdy oczekuje na komunikat na kolejce clients[pid].on_message. Zamiast komunikatu, ma ustawianą flagę clients[pid].done, po czym jest budzony, dzięki czemu dowiaduje się o tym i zakańcza natychmiast.
+        - Wątek czeka na zakończenie (thread_join) i dobiero idzie dalej.
+    f) Kończenie pracy serwera przez CTRL-C:
+        - Wersja z kolejką komunikatów:
+            - Funkcja obsługi sygnału usuwa kolejki komunikatów. Ponieważ jest to kolejka systemV, zachowanie to jest zdefiniowane - wszystkie wątki (w tym główny, a także klienci) dowiadują się dość prędko o zakończeniu pracy i wszyscy poza wątkiem główny się kończą, a wątek główny zwalnia pozostałe zasoby.
+        - Wersja z semaforami:
+            - Funkcja obsługi sygnału, w tej kolejności:
+                - Wysyła sygnały SIGUSR2 do klientów. SIGUSR2 jest u klientów odblokowywany podczas wywołania sigsuspend(...) w metodzie client_getmsg.
+                    - Gwarantuje to, że zakończą się tak szybko, jak zaczną oczekiwać na komunikaty (client_getmsg).
+                - Ustawia flagę "terminating". Flaga ta sprawi, że następne server_getmsg poinformuje główny wątek o tym, że trwa zwalnianie zasobów.
+                - Podnosi wszystkie semafory tak wysoko, żeby jeden pełen cykl wiadomości nie opuścił ich do zera.
+                    - Gwarantuje to - dzięki poprzednim dwóm podpunktom - że nikt się już nie zawiesi na semaforach.
+            - Główny wątek nie odbierze już żadnej wiadomości dzięki fladze "terminating". Tym samym czyszczenie jest bezpieczne.
+            - Na końcu zwalniane są zasoby tak samo, jak w wersji z komunikatami - poza tym tylko, że zasoby bilioteki kom-s zwalniane są na samym końcu (po zjoinowaniu wątków).
+
